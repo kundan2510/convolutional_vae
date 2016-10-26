@@ -14,6 +14,7 @@ from random import shuffle
 import theano
 import theano.tensor as T
 import lasagne
+from theano.compile.nanguardmode import NanGuardMode
 
 import numpy as np
 
@@ -37,13 +38,19 @@ parser = argparse.ArgumentParser()
 
 add_arg = parser.add_argument
 
-add_arg("--eps", default=0.00000001, type=floatX, help= "Epsilon for numerical stability")
+add_arg("--eps", default=0.0000001, type=floatX, help= "Epsilon for numerical stability")
 
 args = parser.parse_args()
 
+# lib.ops.relu.relu = lambda x: T.switch(x < floatX(2.), T.switch(x > floatX(0.), x, floatX(0.)), floatX(2.))
+
 EPS = args.eps
 
+BATCH_SIZE = 100
+
 OUT_DIR = "mnist_conv_vae"
+
+
 
 if not os.path.isdir(OUT_DIR):
 	print "Creating directory {}".format(OUT_DIR)
@@ -288,7 +295,7 @@ def Decoder(latent_var):
 						inputs=output
 				)
 
-	output = T.nnet.sigmoid(output) # shape: (batch_size, 1, 28, 28)
+	output = (T.nnet.sigmoid(output) + EPS)/(floatX(1.) + EPS) # shape: (batch_size, 1, 28, 28)
 
 	output = output.reshape((output.shape[0], 28, 28))
 
@@ -314,6 +321,8 @@ def create_encoder_decoder():
 	input_var_normalised = (input_var - floatX(0.5))
 
 	mu, log_square_sigma = Encoder(input_var_normalised)
+
+	mu = lib.floatX(2.)*T.tanh(mu/lib.floatX(2.))
 
 	sampled_z = gaussian_sampler(mu, log_square_sigma)
 
@@ -344,11 +353,20 @@ def create_encoder_decoder():
 
 	print "Compiling functions ..."
 
-	train_fn = theano.function([input_var, lr], [loss, kl_cost.mean(), log_square_sigma.min(), log_square_sigma.max(), log_square_sigma, mu, sampled_z], updates=updates)
+	train_fn = theano.function(
+					[input_var, lr], 
+					[loss, kl_cost.mean(), mu.min(), mu.max(), mu, sampled_z.min(), sampled_z.max()],
+					updates=updates,
+					# mode=NanGuardMode(nan_is_error=True, inf_is_error=True, big_is_error=True)
+				)
 
 	reconstruct_fn = theano.function([input_var], reconstructed)
 
-	val_fn = theano.function([input_var], [loss, kl_cost.mean(), log_square_sigma.max(), log_square_sigma.min(), log_square_sigma, mu, sampled_z])
+	val_fn = theano.function(
+			[input_var], 
+			[loss, kl_cost.mean(), mu.min(), mu.max(), mu, sampled_z.min(), sampled_z.max()],
+			# mode=NanGuardMode(nan_is_error=True, inf_is_error=True, big_is_error=True)
+		)
 
 	generate_fn = theano.function([generated_z], generated_samples)
 
@@ -357,7 +375,7 @@ def create_encoder_decoder():
 	return train_fn, val_fn, generate_fn, reconstruct_fn, encode_fn
 
 
-def run_epoch(fn, data_dict, batch_size = 1000, mode = 'train'):
+def run_epoch(fn, data_dict, batch_size = BATCH_SIZE, mode = 'train'):
 	X = data_dict['X']
 	shuffle(X)
 	if 'lr' in data_dict:
@@ -370,16 +388,18 @@ def run_epoch(fn, data_dict, batch_size = 1000, mode = 'train'):
 	loss = 0.0
 	kl = 0.0
 	for i in range(num_batches):
-		loss_, kl_, log_var_min, log_var_max, log_square_sigma, mu, sampled_z = fn(X[i::num_batches], *args)
+		loss_, kl_, mu_min, mu_max, mu, sampled_z_min, sampled_z_max = fn(X[i::num_batches], *args)
 		loss += loss_
 		kl += kl_
-		print "loss: {}, KL: {}, log_var_min: {}, log_var_max: {}".format(loss_, kl_, log_var_min, log_var_max)
-		print "Number of nans in mu: {}, in log_square_sigma {}, in sampled_z : {}".format(
-														np.count_nonzero(np.isnan(mu)),
-														np.count_nonzero(np.isnan(log_square_sigma)),
-														np.count_nonzero(np.isnan(sampled_z))
-											)
+		print "loss: {}, KL: {}, mu_min: {}, mu_max: {}, sampled_z.min : {}, sampled_z.max : {}".format(
+														loss_, kl_, 
+														mu_min, mu_max,
+														sampled_z_min, sampled_z_max
+													)
+		print "Number of nans in mu: {}".format(np.count_nonzero(np.isnan(mu)))
+
 		if (loss_ > 1e4) or np.isnan(loss_) :
+			print "loss {} not allowed".format(loss_)
 			exit()
 
 	return loss/num_batches, kl/num_batches
